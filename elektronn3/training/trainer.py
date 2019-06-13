@@ -428,150 +428,163 @@ class Trainer:
         self._save_model(suffix='_final', loss=stats['tr_loss'][-1])
 
     def _train(self, max_steps, max_runtime):
+        try:
 
-        def channel_metric(metric, c, num_classes):
-            """Returns an evaluator that calculates the ``metric``
-            and selects its value for channel ``c``."""
+            def channel_metric(metric, c, num_classes):
+                """Returns an evaluator that calculates the ``metric``
+                and selects its value for channel ``c``."""
 
-            def evaluator(target, out):
-                #pred = metrics._argmax(out)
-                m = metric(target, out, num_classes=num_classes)
-                return m[c]
+                def evaluator(target, out):
+                    #pred = metrics._argmax(out)
+                    m = metric(target, out, num_classes=num_classes)
+                    return m[c]
 
-            return evaluator
+                return evaluator
 
-        num_classes = self.num_classes
-        tr_evaluators = {
-            f'tr_DSC_c{c}': channel_metric(
-                metrics.dice_coefficient,
-                c=c, num_classes=num_classes
-            )
-            for c in range(num_classes)
-        }
+            num_classes = self.num_classes
+            tr_evaluators = {
+                f'tr_DSC_c{c}': channel_metric(
+                    metrics.dice_coefficient,
+                    c=c, num_classes=num_classes
+                )
+                for c in range(num_classes)
+            }
 
-        # Scalar training stats that should be logged and written to tensorboard later
-        stats: Dict[str, list] = {stat: [] for stat in ['tr_loss', 'tr_loss_mean', 'tr_accuracy']}
-        stats.update({name: [] for name in tr_evaluators.keys()})
-        file_stats = {}
-        # Other scalars to be logged
-        misc: Dict[str, float] = {misc: [] for misc in ['mean_target']}
-        # Hold image tensors for real-time training sample visualization in tensorboard
-        images: Dict[str, np.ndarray] = {}
+            # Scalar training stats that should be logged and written to tensorboard later
+            stats: Dict[str, list] = {stat: [] for stat in ['tr_loss', 'tr_loss_mean', 'tr_accuracy']}
+            stats.update({name: [] for name in tr_evaluators.keys()})
+            file_stats = {}
+            # Other scalars to be logged
+            misc: Dict[str, float] = {misc: [] for misc in ['mean_target']}
+            # Hold image tensors for real-time training sample visualization in tensorboard
+            images: Dict[str, np.ndarray] = {}
 
-        self.model.train()
-        self.optimizer.zero_grad()
-        running_vx_size = 0
-        timer = Timer()
-        pbar = tqdm(enumerate(self.train_loader), 'Training', total=len(self.train_loader))
-        for i, (inp, target, multi_class_target, cube_meta, fname) in pbar:
-            # Everything with a "d" prefix refers to tensors on self.device (i.e. probably on GPU)
-            dinp = inp.to(self.device, non_blocking=True)
-            dtarget = target.to(self.device, non_blocking=True)
-            weight = cube_meta[0].to(device=self.device, dtype=self.criterion.weight.dtype, non_blocking=True)
-            prev_weight = self.criterion.weight.clone()
-            self.criterion.weight *= weight
-            #self.criterion.weight = None
-            #self.criterion.pos_weight = prev_weight * weight
-            #self.criterion.pos_weight = self.criterion.pos_weight.view(-1,1,1,1)
-            #self.criterion.weight = self.criterion.weight.view(-1,1,1,1)
-            #self.criterion.pos_weight = self.criterion.weight
+            self.model.train()
+            self.optimizer.zero_grad()
+            running_vx_size = 0
+            timer = Timer()
+            pbar = tqdm(enumerate(self.train_loader), 'Training', total=len(self.train_loader))
+            for i, (inp, target, multi_class_target, cube_meta, fname) in pbar:
+                # Everything with a "d" prefix refers to tensors on self.device (i.e. probably on GPU)
+                dinp = inp.to(self.device, non_blocking=True)
+                dtarget = target.to(self.device, non_blocking=True)
+                weight = cube_meta[0].to(device=self.device, dtype=self.criterion.weight.dtype, non_blocking=True)
+                prev_weight = self.criterion.weight.clone()
+                self.criterion.weight *= weight
+                #self.criterion.weight = None
+                #self.criterion.pos_weight = prev_weight * weight
+                #self.criterion.pos_weight = self.criterion.pos_weight.view(-1,1,1,1)
+                #self.criterion.weight = self.criterion.weight.view(-1,1,1,1)
+                #self.criterion.pos_weight = self.criterion.weight
 
-            # forward pass
-            dout = self.model(dinp)
+                # forward pass
+                dout = self.model(dinp)
 
-            #print(dout.dtype, dout.shape, dtarget.dtype, dtarget.shape, dout.min(), dout.max())
-            dloss = self.criterion(dout, dtarget)
-            #dcumloss = dloss if i == 0 else dcumloss + dloss
-            #print(dloss, dloss.size())
-            #dloss = (dloss * prev_weight * weight).mean()
-            if torch.isnan(dloss).sum():
-                logger.error('NaN loss detected! Aborting training.')
-                raise NaNException
+                #print(dout.dtype, dout.shape, dtarget.dtype, dtarget.shape, dout.min(), dout.max())
+                dloss = self.criterion(dout, dtarget)
+                #dcumloss = dloss if i == 0 else dcumloss + dloss
+                #print(dloss, dloss.size())
+                #dloss = (dloss * prev_weight * weight).mean()
+                if torch.isnan(dloss).sum():
+                    logger.error('NaN loss detected! Aborting training.')
+                    raise NaNException
 
-            # update step
-            dloss.backward()
-            if i % self.optimizer_iterations == self.optimizer_iterations - 1:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                #loss2 = float(self.criterion(self.model(dinp), dtarget))
-                #print(f'loss gain factor {np.divide(float(dloss), (float(dloss)-loss2))})')
-            # End of core training loop on self.device
-
-            with torch.no_grad():
-                loss = float(dloss)
-            	# TODO: Evaluate performance impact of these copies and maybe avoid doing these so often
-                out_class = dout.argmax(dim=1).detach().cpu()
-                acc = metrics.accuracy(multi_class_target, out_class, num_classes)
-                acc = np.average(acc[~np.isnan(acc)])#, weights=)
-                mean_target = float(multi_class_target.to(torch.float32).mean())
-
-                if fname[0] not in file_stats:
-                    file_stats[fname[0]] = []
-                file_stats[fname[0]] += [float('nan')] * (i - len(file_stats[fname[0]])) + [loss]
-
-                stats['tr_loss'].append(loss)
-                stats['tr_loss_mean'] += [float('nan')] * (i - len(stats['tr_loss_mean']))
+                # update step
+                dloss.backward()
                 if i % self.optimizer_iterations == self.optimizer_iterations - 1:
-                    stats['tr_loss_mean'] += [np.mean(stats['tr_loss'][-self.optimizer_iterations:])]
-                stats['tr_accuracy'].append(acc)
-                for name, evaluator in tr_evaluators.items():
-                    stats[name].append(evaluator(multi_class_target, out_class))
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    #loss2 = float(self.criterion(self.model(dinp), dtarget))
+                    #print(f'loss gain factor {np.divide(float(dloss), (float(dloss)-loss2))})')
+                # End of core training loop on self.device
 
-                #if stats['tr_DSC_c3'][-1] < 5:
-                #    IPython.embed()
+                with torch.no_grad():
+                    loss = float(dloss)
+                    # TODO: Evaluate performance impact of these copies and maybe avoid doing these so often
+                    out_class = dout.argmax(dim=1).detach().cpu()
+                    acc = metrics.accuracy(multi_class_target, out_class, num_classes)
+                    acc = np.average(acc[~np.isnan(acc)])#, weights=)
+                    mean_target = float(multi_class_target.to(torch.float32).mean())
 
-                misc['mean_target'].append(mean_target)
-                # if loss-loss2 == 0 and not torch.any(out_class != multi_class_target):
-                #     print('grad', self.model.up_convs[0].conv2.weight.grad)
-                #     IPython.embed()
-                #if loss - 0.99 < 1e-3:
-                #    print('asd', loss, loss2)
-                #    IPython.embed()
-                pbar.set_description(f'Training (loss {loss})')
-                #pbar.set_description(f'Training (loss {loss} / {float(dcumloss)})')
-                #pbar.set_description(f'Training (loss {loss} / {np.divide(loss, (loss-loss2))})')
-                self._tracker.update_timeline([self._timer.t_passed, loss, mean_target])
+                    if fname[0] not in file_stats:
+                        file_stats[fname[0]] = []
+                    file_stats[fname[0]] += [float('nan')] * (i - len(file_stats[fname[0]])) + [loss]
 
-            self.criterion.weight = prev_weight
+                    stats['tr_loss'].append(loss)
+                    stats['tr_loss_mean'] += [float('nan')] * (i - len(stats['tr_loss_mean']))
+                    if i % self.optimizer_iterations == self.optimizer_iterations - 1:
+                        stats['tr_loss_mean'] += [np.mean(stats['tr_loss'][-self.optimizer_iterations:])]
+                    stats['tr_accuracy'].append(acc)
+                    for name, evaluator in tr_evaluators.items():
+                        stats[name].append(evaluator(multi_class_target, out_class))
 
-            # this was changed to support ReduceLROnPlateau which does not implement get_lr
-            misc['learning_rate'] = self.optimizer.param_groups[0]["lr"]  # .get_lr()[-1]
-            # update schedules
-            for sched in self.schedulers.values():
-                # support ReduceLROnPlateau; doc. uses validation loss instead
-                # http://pytorch.org/docs/master/optim.html#torch.optim.lr_scheduler.ReduceLROnPlateau
-                if "metrics" in inspect.signature(sched.step).parameters:
-                    sched.step(metrics=loss)
-                else:
-                    sched.step()
+                    #if stats['tr_DSC_c3'][-1] < 5:
+                    #    IPython.embed()
 
-            running_vx_size += inp.numel()
+                    misc['mean_target'].append(mean_target)
+                    # if loss-loss2 == 0 and not torch.any(out_class != multi_class_target):
+                    #     print('grad', self.model.up_convs[0].conv2.weight.grad)
+                    #     IPython.embed()
+                    #if loss - 0.99 < 1e-3:
+                    #    print('asd', loss, loss2)
+                    #    IPython.embed()
+                    pbar.set_description(f'Training (loss {loss})')
+                    #pbar.set_description(f'Training (loss {loss} / {float(dcumloss)})')
+                    #pbar.set_description(f'Training (loss {loss} / {np.divide(loss, (loss-loss2))})')
+                    self._tracker.update_timeline([self._timer.t_passed, loss, mean_target])
 
-            #if stats['tr_loss_mean'][-1] < self.best_tr_loss:
-            #   self.best_tr_loss = stats['tr_loss'][-1]
-            #   self._save_model(suffix='_best_train', loss=stats['tr_loss'][-1])
+                self.criterion.weight = prev_weight
 
-            self.step += 1
-            if self.step >= max_steps:
-                logger.info(f'max_steps ({max_steps}) exceeded. Terminating...')
-                self.terminate = True
-            if datetime.datetime.now() >= self.end_time:
-                logger.info(f'max_runtime ({max_runtime} seconds) exceeded. Terminating...')
-                self.terminate = True
-            if i == len(self.train_loader) - 1 or self.terminate:
-                # Last step in this epoch or in the whole training
-                # Preserve last training batch and network output for later visualization
-                images['inp'] = inp.numpy()
-                images['target'] = multi_class_target.numpy()
-                images['out'] = dout.detach().cpu().numpy()
+                # this was changed to support ReduceLROnPlateau which does not implement get_lr
+                misc['learning_rate'] = self.optimizer.param_groups[0]["lr"]  # .get_lr()[-1]
+                # update schedules
+                for sched in self.schedulers.values():
+                    # support ReduceLROnPlateau; doc. uses validation loss instead
+                    # http://pytorch.org/docs/master/optim.html#torch.optim.lr_scheduler.ReduceLROnPlateau
+                    if "metrics" in inspect.signature(sched.step).parameters:
+                        sched.step(metrics=loss)
+                    else:
+                        sched.step()
 
-            if self.terminate:
-                break
+                running_vx_size += inp.numel()
 
-        misc['tr_speed'] = len(self.train_loader) / timer.t_passed
-        misc['tr_speed_vx'] = running_vx_size / timer.t_passed / 1e6  # MVx
+                #if stats['tr_loss_mean'][-1] < self.best_tr_loss:
+                #   self.best_tr_loss = stats['tr_loss'][-1]
+                #   self._save_model(suffix='_best_train', loss=stats['tr_loss'][-1])
 
-        return stats, file_stats, misc, images
+                self.step += 1
+                if self.step >= max_steps:
+                    logger.info(f'max_steps ({max_steps}) exceeded. Terminating...')
+                    self.terminate = True
+                if datetime.datetime.now() >= self.end_time:
+                    logger.info(f'max_runtime ({max_runtime} seconds) exceeded. Terminating...')
+                    self.terminate = True
+                if i == len(self.train_loader) - 1 or self.terminate:
+                    # Last step in this epoch or in the whole training
+                    # Preserve last training batch and network output for later visualization
+                    images['inp'] = inp.numpy()
+                    images['target'] = multi_class_target.numpy()
+                    images['out'] = dout.detach().cpu().numpy()
+
+                if self.terminate:
+                    break
+
+            misc['tr_speed'] = len(self.train_loader) / timer.t_passed
+            misc['tr_speed_vx'] = running_vx_size / timer.t_passed / 1e6  # MVx
+
+            return stats, file_stats, misc, images
+        except Exception as e:
+            logger.exception('Unhandled exception during training:')
+            if self.ignore_errors:
+                # Just print the traceback and try to carry on with training.
+                # This can go wrong in unexpected ways, so don't leave the training unattended.
+                pass
+            elif self.ipython_shell:
+                print("\nEntering Command line such that Exception can be "
+                      "further inspected by user.\n\n")
+                IPython.embed(header=self._shell_info)
+                if self.terminate:
+                    exit()
 
     def _validate(self) -> Dict[str, float]:
         self.model.eval()  # Set dropout and batchnorm to eval mode
